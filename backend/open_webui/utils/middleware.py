@@ -1602,6 +1602,295 @@ def get_images_from_messages(message_list):
     return images
 
 
+AUTO_ROUTE_IMAGE_GENERATION_RE = re.compile(
+    r'\b(draw|generate image|create image|illustration|poster|logo|banner|render)\b|'
+    r'(нарисуй|сгенерируй\s+(?:картинк|изображен)|создай\s+(?:картинк|иллюстрац)|сделай\s+(?:арт|логотип|баннер))',
+    re.IGNORECASE,
+)
+AUTO_ROUTE_WEB_RE = re.compile(
+    r'\b(research|deep research|web search|search the web|browse|find online)\b|'
+    r'(найди|поищи|поиск\s+в\s+интернет|в\s+интернет|в\s+сети|исследуй|ресерч)',
+    re.IGNORECASE,
+)
+VISION_MODEL_HINTS = (
+    'vision',
+    'vlm',
+    'llava',
+    'qwen-vl',
+    'pixtral',
+    'gpt-4o',
+    'omni',
+    'gemini',
+    'claude-3',
+    'claude-sonnet',
+    'claude-opus',
+)
+AUTO_ROUTE_MODEL_PREFERENCES = {
+    'text': ['mws-gpt-alpha'],
+    'vision': ['qwen2.5-vl', 'cotype-pro-vl-32b'],
+    'files': ['mws-gpt-alpha', 'qwen2.5-vl', 'cotype-pro-vl-32b'],
+    'web': ['mws-gpt-alpha'],
+    'image_generation': ['mws-gpt-alpha'],
+    'audio': ['whisper-medium'],
+    'embedding': ['bge-m3'],
+}
+
+
+def get_non_image_files_from_messages(message_list: list[dict]) -> list[dict]:
+    files = []
+
+    for message in message_list:
+        for file in message.get('files', []):
+            content_type = file.get('content_type', '') or ''
+            if file.get('type') == 'image' or content_type.startswith('image/'):
+                continue
+            files.append(file)
+
+    return files
+
+
+def get_message_image_parts(message_list: list[dict]) -> list[dict]:
+    image_parts = []
+
+    for message in message_list:
+        content = message.get('content')
+        if not isinstance(content, list):
+            continue
+
+        for item in content:
+            if isinstance(item, dict) and item.get('type') in ('image_url', 'input_image'):
+                image_parts.append(item)
+
+    return image_parts
+
+
+def has_image_files(file_list: Optional[list[dict]]) -> bool:
+    if not isinstance(file_list, list):
+        return False
+
+    for file in file_list:
+        if not isinstance(file, dict):
+            continue
+
+        content_type = (file.get('content_type') or '').lower()
+        if file.get('type') == 'image' or content_type.startswith('image/'):
+            return True
+
+    return False
+
+
+def detect_auto_route(form_data: dict, metadata: dict) -> dict:
+    messages = form_data.get('messages', [])
+    user_message = (get_last_user_message(messages) or '').strip()
+    urls = extract_urls(user_message)
+    image_inputs = bool(
+        get_images_from_messages(messages)
+        or get_message_image_parts(messages)
+        or has_image_files(form_data.get('files'))
+        or has_image_files(metadata.get('files'))
+    )
+    file_inputs = bool(get_non_image_files_from_messages(messages) or form_data.get('files') or metadata.get('files'))
+
+    features = form_data.setdefault('features', {})
+    route = 'text'
+    reason = 'default_text'
+
+    if AUTO_ROUTE_IMAGE_GENERATION_RE.search(user_message):
+        features['image_generation'] = True
+        route = 'image_generation'
+        reason = 'image_generation_intent'
+    elif image_inputs:
+        route = 'vision'
+        reason = 'image_input'
+    elif file_inputs:
+        route = 'files'
+        reason = 'file_input'
+
+    if urls or AUTO_ROUTE_WEB_RE.search(user_message):
+        features['web_search'] = True
+        if route == 'text':
+            route = 'web'
+            reason = 'web_intent' if not urls else 'url_in_message'
+
+    return {
+        'route': route,
+        'reason': reason,
+        'user_message': user_message,
+    }
+
+
+def score_model_for_auto_route(model: dict, route: str) -> int:
+    meta = model.get('info', {}).get('meta', {})
+    capabilities = meta.get('capabilities') or {}
+    builtin_tools = meta.get('builtinTools') or {}
+    haystack = f"{model.get('id', '')} {model.get('name', '')}".lower()
+
+    score = 0
+
+    if route == 'vision':
+        if any(token in haystack for token in VISION_MODEL_HINTS):
+            score += 6
+        if capabilities.get('file_context', True):
+            score += 2
+
+    elif route == 'files':
+        if capabilities.get('file_context', True):
+            score += 5
+        if any(token in haystack for token in VISION_MODEL_HINTS):
+            score += 1
+
+    elif route == 'web':
+        if capabilities.get('web_search', False):
+            score += 6
+        if builtin_tools.get('web_search', True):
+            score += 1
+        if 'search' in haystack or 'research' in haystack or 'reason' in haystack:
+            score += 1
+
+    elif route == 'image_generation':
+        if capabilities.get('image_generation', False):
+            score += 6
+        if builtin_tools.get('image_generation', True):
+            score += 1
+
+    else:
+        if capabilities.get('file_context', True):
+            score += 1
+        if not capabilities.get('image_generation', False):
+            score += 1
+
+    if model.get('owned_by') == 'arena':
+        score -= 100
+
+    return score
+
+
+def is_model_vision_capable(model: Optional[dict]) -> bool:
+    if not model:
+        return False
+
+    meta = model.get('info', {}).get('meta', {})
+    capabilities = meta.get('capabilities') or {}
+    if capabilities.get('vision', False):
+        return True
+
+    haystack = f"{model.get('id', '')} {model.get('name', '')}".lower()
+    return any(token in haystack for token in VISION_MODEL_HINTS)
+
+
+def select_auto_route_model(models: dict, candidate_ids: list[str], route: str, fallback_model_id: str) -> str:
+    preferred_ids = AUTO_ROUTE_MODEL_PREFERENCES.get(route, [])
+    for preferred_id in preferred_ids:
+        if preferred_id in candidate_ids and models.get(preferred_id):
+            return preferred_id
+
+    best_model_id = fallback_model_id
+    best_score = float('-inf')
+
+    for index, model_id in enumerate(candidate_ids):
+        model = models.get(model_id)
+        if not model:
+            continue
+
+        score = score_model_for_auto_route(model, route)
+        score -= index * 0.01
+
+        if score > best_score:
+            best_score = score
+            best_model_id = model_id
+
+    return best_model_id
+
+
+def enforce_auto_route_model(models: dict, current_model_id: str, route_info: dict) -> str:
+    route = route_info.get('route', 'text')
+    current_model = models.get(current_model_id)
+
+    if route != 'vision':
+        return current_model_id
+
+    if is_model_vision_capable(current_model):
+        return current_model_id
+
+    for preferred_id in AUTO_ROUTE_MODEL_PREFERENCES.get('vision', []):
+        preferred_model = models.get(preferred_id)
+        if preferred_model and is_model_vision_capable(preferred_model):
+            return preferred_id
+
+    return current_model_id
+
+
+def apply_hard_multimodal_routing(request: Request, form_data: dict, metadata: dict, model: dict) -> tuple[dict, dict]:
+    """
+    Hard safety override for multimodal inputs.
+
+    If an image is present and the currently selected chat model is text-only,
+    route the request to a configured vision model even outside arena/auto mode.
+    """
+    route_info = detect_auto_route(form_data, metadata)
+    enforced_model_id = enforce_auto_route_model(request.app.state.MODELS, form_data['model'], route_info)
+
+    if enforced_model_id == form_data['model']:
+        return form_data, model
+
+    enforced_model = request.app.state.MODELS.get(enforced_model_id)
+    if not enforced_model:
+        return form_data, model
+
+    form_data['model'] = enforced_model_id
+    metadata['selected_model_id'] = enforced_model_id
+    metadata['auto_route'] = {
+        'route': route_info['route'],
+        'reason': f"{route_info['reason']}:hard_multimodal_override",
+        'selected_model_id': enforced_model_id,
+    }
+    return form_data, enforced_model
+
+
+def apply_arena_auto_route(request: Request, form_data: dict, metadata: dict, model: dict) -> tuple[dict, dict]:
+    if model.get('owned_by') != 'arena':
+        return form_data, model
+
+    arena_model_ids = model.get('info', {}).get('meta', {}).get('model_ids')
+    arena_filter_mode = model.get('info', {}).get('meta', {}).get('filter_mode')
+    if arena_model_ids and arena_filter_mode == 'exclude':
+        arena_model_ids = [
+            available_model['id']
+            for available_model in request.app.state.MODELS.values()
+            if available_model.get('owned_by') != 'arena' and available_model['id'] not in arena_model_ids
+        ]
+
+    if isinstance(arena_model_ids, list) and arena_model_ids:
+        candidate_model_ids = arena_model_ids
+    else:
+        candidate_model_ids = [
+            available_model['id']
+            for available_model in request.app.state.MODELS.values()
+            if available_model.get('owned_by') != 'arena'
+        ]
+
+    route_info = detect_auto_route(form_data, metadata)
+    selected_model_id = select_auto_route_model(
+        request.app.state.MODELS,
+        candidate_model_ids,
+        route_info['route'],
+        candidate_model_ids[0] if candidate_model_ids else form_data['model'],
+    )
+
+    selected_model = request.app.state.MODELS.get(selected_model_id)
+    if not selected_model:
+        return form_data, model
+
+    form_data['model'] = selected_model_id
+    metadata['selected_model_id'] = selected_model_id
+    metadata['auto_route'] = {
+        'route': route_info['route'],
+        'reason': route_info['reason'],
+        'selected_model_id': selected_model_id,
+    }
+    return form_data, selected_model
+
+
 def get_image_urls(delta_images, request, metadata, user) -> list[str]:
     if not isinstance(delta_images, list):
         return []
@@ -2111,9 +2400,9 @@ async def process_chat_payload(request, form_data, user, metadata, model):
     # -> Chat Code Interpreter (Form Data Update) -> (Default) Chat Tools Function Calling
     # -> Chat Files
 
-    # Arena model resolution — pick the sub-model now so all downstream
-    # processing (knowledge, capabilities, tools, params) uses its settings
-    # instead of the empty arena wrapper.
+    # Arena model resolution doubles as "auto mode": when the user selects
+    # the arena/auto model, pick the best sub-model for the current task
+    # instead of choosing randomly.
     if model.get('owned_by') == 'arena':
         arena_model_ids = model.get('info', {}).get('meta', {}).get('model_ids')
         arena_filter_mode = model.get('info', {}).get('meta', {}).get('filter_mode')
@@ -2125,20 +2414,35 @@ async def process_chat_payload(request, form_data, user, metadata, model):
             ]
 
         if isinstance(arena_model_ids, list) and arena_model_ids:
-            selected_model_id = random.choice(arena_model_ids)
+            candidate_model_ids = arena_model_ids
         else:
             arena_model_ids = [
                 available_model['id']
                 for available_model in request.app.state.MODELS.values()
                 if available_model.get('owned_by') != 'arena'
             ]
-            selected_model_id = random.choice(arena_model_ids)
+            candidate_model_ids = arena_model_ids
+
+        route_info = detect_auto_route(form_data, metadata)
+        selected_model_id = select_auto_route_model(
+            request.app.state.MODELS,
+            candidate_model_ids,
+            route_info['route'],
+            candidate_model_ids[0] if candidate_model_ids else form_data['model'],
+        )
 
         selected_model = request.app.state.MODELS.get(selected_model_id)
         if selected_model:
             model = selected_model
             form_data['model'] = selected_model_id
             metadata['selected_model_id'] = selected_model_id
+            metadata['auto_route'] = {
+                'route': route_info['route'],
+                'reason': route_info['reason'],
+                'selected_model_id': selected_model_id,
+            }
+
+    form_data, model = apply_hard_multimodal_routing(request, form_data, metadata, model)
 
     form_data = apply_params_to_form_data(form_data, model)
     log.debug(f'form_data: {form_data}')
@@ -2180,6 +2484,15 @@ async def process_chat_payload(request, form_data, user, metadata, model):
 
     # Process messages with OR-aligned output items for clean LLM messages
     form_data['messages'] = process_messages_with_output(form_data.get('messages', []))
+
+    # Re-run routing after DB/history file injection so image uploads are visible.
+    rerouted_model = model
+    form_data, rerouted_model = apply_arena_auto_route(request, form_data, metadata, rerouted_model)
+    form_data, rerouted_model = apply_hard_multimodal_routing(request, form_data, metadata, rerouted_model)
+    if rerouted_model.get('id') != model.get('id'):
+        model = rerouted_model
+        form_data = apply_params_to_form_data(form_data, model)
+        log.debug(f'rerouted form_data: {form_data}')
 
     system_message = get_system_message(form_data.get('messages', []))
     if system_message:  # Chat Controls/User Settings

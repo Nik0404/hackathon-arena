@@ -50,6 +50,7 @@ from open_webui.utils.payload import (
     apply_system_prompt_to_body,
 )
 from open_webui.utils.misc import (
+    add_or_update_system_message,
     cleanup_response,
     convert_logit_bias_input_to_json,
     stream_chunks_handler,
@@ -62,6 +63,9 @@ from open_webui.utils.anthropic import is_anthropic_url, get_anthropic_models
 
 log = logging.getLogger(__name__)
 
+VISION_ROUTE_MODEL_IDS = ('qwen2.5-vl', 'cotype-pro-vl-32b')
+VISION_MODEL_HINTS = ('vision', 'vl', 'vlm', 'llava', 'pixtral', 'omni')
+
 
 ##########################################
 #
@@ -70,6 +74,51 @@ log = logging.getLogger(__name__)
 # the question that summoned them.
 #
 ##########################################
+
+
+def payload_has_image_input(payload: dict, metadata: Optional[dict] = None) -> bool:
+    for file in (payload.get('files') or []) + ((metadata or {}).get('files') or []):
+        if not isinstance(file, dict):
+            continue
+        content_type = (file.get('content_type') or '').lower()
+        if file.get('type') == 'image' or content_type.startswith('image/'):
+            return True
+
+    for message in payload.get('messages', []):
+        content = message.get('content')
+        if not isinstance(content, list):
+            continue
+
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get('type') in ('image_url', 'input_image'):
+                return True
+
+    return False
+
+
+def is_vision_model_id(model_id: Optional[str]) -> bool:
+    if not model_id:
+        return False
+
+    haystack = model_id.lower()
+    return model_id in VISION_ROUTE_MODEL_IDS or any(token in haystack for token in VISION_MODEL_HINTS)
+
+
+def select_openai_vision_model_id(request: Request) -> Optional[str]:
+    available_model_ids = set(request.app.state.OPENAI_MODELS.keys()) if request.app.state.OPENAI_MODELS else set()
+    available_model_ids.update(request.app.state.MODELS.keys())
+
+    for model_id in VISION_ROUTE_MODEL_IDS:
+        if model_id in available_model_ids:
+            return model_id
+
+    for model_id in available_model_ids:
+        if is_vision_model_id(model_id):
+            return model_id
+
+    return None
 
 
 async def send_get_request(
@@ -975,11 +1024,34 @@ def convert_responses_result(response: dict) -> dict:
     output_items = response.get('output', [])
 
     content = ''
+    tool_calls = []
     for item in output_items:
-        if item.get('type') == 'message':
+        item_type = item.get('type')
+        if item_type == 'message':
             for part in item.get('content', []):
                 if part.get('type') == 'output_text':
                     content += part.get('text', '')
+                elif part.get('type') == 'refusal':
+                    content += part.get('refusal', '')
+        elif item_type == 'function_call':
+            tool_calls.append(
+                {
+                    'id': item.get('call_id', item.get('id', '')),
+                    'type': 'function',
+                    'function': {
+                        'name': item.get('name', ''),
+                        'arguments': item.get('arguments', '{}'),
+                    },
+                }
+            )
+
+    message = {
+        'role': 'assistant',
+        'content': content,
+        'output': output_items,
+    }
+    if tool_calls:
+        message['tool_calls'] = tool_calls
 
     return {
         'id': response.get('id', ''),
@@ -988,15 +1060,93 @@ def convert_responses_result(response: dict) -> dict:
         'choices': [
             {
                 'index': 0,
-                'message': {
-                    'role': 'assistant',
-                    'content': content,
-                },
-                'finish_reason': 'stop',
+                'message': message,
+                'finish_reason': 'tool_calls' if tool_calls else 'stop',
             }
         ],
         'usage': response.get('usage', {}),
     }
+
+
+def merge_prompt_text(base: Optional[str], addition: Optional[str]) -> Optional[str]:
+    base = base or ''
+    addition = addition or ''
+
+    if base and addition:
+        if addition in base:
+            return base
+        return f'{base}\n\n{addition}'
+
+    return base or addition or None
+
+
+def normalize_responses_payload(payload: dict) -> dict:
+    if 'max_tokens' in payload:
+        payload['max_output_tokens'] = payload.pop('max_tokens')
+
+    if 'max_completion_tokens' in payload:
+        payload['max_output_tokens'] = payload.pop('max_completion_tokens')
+
+    for unsupported_key in (
+        'messages',
+        'stream_options',
+        'logit_bias',
+        'frequency_penalty',
+        'presence_penalty',
+        'stop',
+    ):
+        payload.pop(unsupported_key, None)
+
+    return payload
+
+
+def check_model_permission(model_info, user, bypass_filter: bool) -> None:
+    if model_info:
+        if not bypass_filter and user.role == 'user':
+            user_group_ids = {group.id for group in Groups.get_groups_by_member_id(user.id)}
+            if not (
+                user.id == model_info.user_id
+                or AccessGrants.has_access(
+                    user_id=user.id,
+                    resource_type='model',
+                    resource_id=model_info.id,
+                    permission='read',
+                    user_group_ids=user_group_ids,
+                )
+            ):
+                raise HTTPException(
+                    status_code=403,
+                    detail='Model not found',
+                )
+    elif not bypass_filter and user.role != 'admin':
+        raise HTTPException(
+            status_code=403,
+            detail='Model not found',
+        )
+
+
+async def resolve_openai_model_route(request: Request, user: UserModel, model_id: str):
+    models = request.app.state.OPENAI_MODELS
+    if not models or model_id not in models:
+        await get_all_models(request, user=user)
+        models = request.app.state.OPENAI_MODELS
+
+    model = models.get(model_id)
+    if not model:
+        raise HTTPException(
+            status_code=404,
+            detail='Model not found',
+        )
+
+    idx = model['urlIdx']
+    api_config = request.app.state.config.OPENAI_API_CONFIGS.get(
+        str(idx),
+        request.app.state.config.OPENAI_API_CONFIGS.get(
+            request.app.state.config.OPENAI_API_BASE_URLS[idx], {}
+        ),  # Legacy support
+    )
+
+    return model, idx, api_config
 
 
 @router.post('/chat/completions')
@@ -1022,9 +1172,11 @@ async def generate_chat_completion(
 
     payload = {**form_data}
     metadata = payload.pop('metadata', None)
+    memory_prompt = metadata.get('memory_prompt') if isinstance(metadata, dict) else None
 
     model_id = form_data.get('model')
     model_info = Models.get_model_by_id(model_id)
+    routed_model_id = model_id
 
     # Check model info and override the payload
     if model_info:
@@ -1033,7 +1185,7 @@ async def generate_chat_completion(
                 request.base_model_id if hasattr(request, 'base_model_id') else model_info.base_model_id
             )  # Use request's base_model_id if available
             payload['model'] = base_model_id
-            model_id = base_model_id
+            routed_model_id = base_model_id
 
         params = model_info.params.model_dump()
 
@@ -1044,52 +1196,26 @@ async def generate_chat_completion(
             if not bypass_system_prompt:
                 payload = apply_system_prompt_to_body(system, payload, metadata, user)
 
-        # Check if user has access to the model
-        if not bypass_filter and user.role == 'user':
-            user_group_ids = {group.id for group in Groups.get_groups_by_member_id(user.id)}
-            if not (
-                user.id == model_info.user_id
-                or AccessGrants.has_access(
-                    user_id=user.id,
-                    resource_type='model',
-                    resource_id=model_info.id,
-                    permission='read',
-                    user_group_ids=user_group_ids,
-                )
-            ):
-                raise HTTPException(
-                    status_code=403,
-                    detail='Model not found',
-                )
-    elif not bypass_filter:
-        if user.role != 'admin':
-            raise HTTPException(
-                status_code=403,
-                detail='Model not found',
-            )
+    check_model_permission(model_info, user, bypass_filter)
 
-    # Check if model is already in app state cache to avoid expensive get_all_models() call
-    models = request.app.state.OPENAI_MODELS
-    if not models or model_id not in models:
-        await get_all_models(request, user=user)
-        models = request.app.state.OPENAI_MODELS
-    model = models.get(model_id)
+    if payload_has_image_input(payload, metadata) and not is_vision_model_id(routed_model_id):
+        vision_model_id = select_openai_vision_model_id(request)
+        if vision_model_id:
+            payload['model'] = vision_model_id
+            routed_model_id = vision_model_id
+            if isinstance(metadata, dict):
+                metadata['selected_model_id'] = vision_model_id
+                metadata['auto_route'] = {
+                    'route': 'vision',
+                    'reason': 'openai_router_multimodal_guard',
+                    'selected_model_id': vision_model_id,
+                }
+            log.info(f'OpenAI router multimodal guard rerouted request from {model_id} to {vision_model_id}')
 
-    if model:
-        idx = model['urlIdx']
-    else:
-        raise HTTPException(
-            status_code=404,
-            detail='Model not found',
-        )
+    if memory_prompt:
+        payload['messages'] = add_or_update_system_message(memory_prompt, payload.get('messages', []), append=True)
 
-    # Get the API config for the model
-    api_config = request.app.state.config.OPENAI_API_CONFIGS.get(
-        str(idx),
-        request.app.state.config.OPENAI_API_CONFIGS.get(
-            request.app.state.config.OPENAI_API_BASE_URLS[idx], {}
-        ),  # Legacy support
-    )
+    model, idx, api_config = await resolve_openai_model_route(request, user, routed_model_id)
 
     prefix_id = api_config.get('prefix_id', None)
     if prefix_id:
@@ -1329,25 +1455,37 @@ async def responses(
     Forward requests to the OpenAI Responses API endpoint.
     Routes to the correct upstream backend based on the model field.
     """
+    bypass_filter = getattr(request.state, 'bypass_filter', False)
+    if BYPASS_MODEL_ACCESS_CONTROL:
+        bypass_filter = True
+
     payload = form_data.model_dump(exclude_none=True)
-    body = json.dumps(payload)
+    metadata = payload.pop('metadata', None)
+    memory_prompt = metadata.get('memory_prompt') if isinstance(metadata, dict) else None
 
-    idx = 0
     model_id = form_data.model
-    if model_id:
-        models = request.app.state.OPENAI_MODELS
-        if not models or model_id not in models:
-            await get_all_models(request, user=user)
-            models = request.app.state.OPENAI_MODELS
-        if model_id in models:
-            idx = models[model_id]['urlIdx']
+    model_info = Models.get_model_by_id(model_id)
 
+    if model_info and model_info.base_model_id:
+        base_model_id = request.base_model_id if hasattr(request, 'base_model_id') else model_info.base_model_id
+        payload['model'] = base_model_id
+        model_id = base_model_id
+
+    if model_info:
+        params = model_info.params.model_dump()
+        if params:
+            system = params.pop('system', None)
+            payload = apply_model_params_to_body_openai(params, payload)
+            payload['instructions'] = merge_prompt_text(system, payload.get('instructions'))
+
+    if memory_prompt:
+        payload['instructions'] = merge_prompt_text(payload.get('instructions'), memory_prompt)
+
+    check_model_permission(model_info, user, bypass_filter)
+
+    model, idx, api_config = await resolve_openai_model_route(request, user, model_id)
     url = request.app.state.config.OPENAI_API_BASE_URLS[idx]
     key = request.app.state.config.OPENAI_API_KEYS[idx]
-    api_config = request.app.state.config.OPENAI_API_CONFIGS.get(
-        str(idx),
-        request.app.state.config.OPENAI_API_CONFIGS.get(url, {}),  # Legacy support
-    )
 
     r = None
     session = None
@@ -1355,6 +1493,13 @@ async def responses(
 
     try:
         headers, cookies = await get_headers_and_cookies(request, url, key, api_config, user=user)
+
+        prefix_id = api_config.get('prefix_id', None)
+        if prefix_id and payload.get('model'):
+            payload['model'] = payload['model'].replace(f'{prefix_id}.', '')
+
+        payload = normalize_responses_payload(payload)
+        body = json.dumps(payload)
 
         if api_config.get('azure', False):
             api_version = api_config.get('api_version', '2023-03-15-preview')

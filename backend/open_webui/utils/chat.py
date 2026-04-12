@@ -51,6 +51,10 @@ from open_webui.utils.filter import (
 )
 
 from open_webui.env import GLOBAL_LOG_LEVEL, BYPASS_MODEL_ACCESS_CONTROL
+from open_webui.utils.memory import (
+    apply_long_term_memory_to_form_data,
+    inject_memory_prompt_into_messages,
+)
 
 logging.basicConfig(stream=sys.stdout, level=GLOBAL_LOG_LEVEL)
 log = logging.getLogger(__name__)
@@ -179,6 +183,16 @@ async def generate_chat_completion(
                 **request.state.metadata,
             }
 
+    # ========== ХАКАТОН: ПАМЯТЬ ==========
+    # UI сохраняет чат через POST /chats/{id}, а не /messages/..., поэтому извлечение
+    # фактов делаем здесь — на каждом запросе к LLM, до OpenAI/Ollama/pipe.
+    if user is not None and getattr(user, 'id', None) is not None:
+        try:
+            apply_long_term_memory_to_form_data(form_data, user.id)
+        except Exception as e:
+            log.warning('[MEMORY] apply_long_term_memory_to_form_data: %s', e)
+    # ================================================
+
     if getattr(request.state, 'direct', False) and hasattr(request.state, 'model'):
         models = {
             request.state.model['id']: request.state.model,
@@ -194,6 +208,7 @@ async def generate_chat_completion(
     model = models[model_id]
 
     if getattr(request.state, 'direct', False):
+        inject_memory_prompt_into_messages(form_data)
         return await generate_direct_chat_completion(request, form_data, user=user, models=models)
     else:
         # Check if user has access to the model
@@ -272,9 +287,11 @@ async def generate_chat_completion(
                 }
 
         if model.get('pipe'):
+            inject_memory_prompt_into_messages(form_data)
             # Below does not require bypass_filter because this is the only route the uses this function and it is already bypassing the filter
             return await generate_function_chat_completion(request, form_data, user=user, models=models)
         if model.get('owned_by') == 'ollama':
+            inject_memory_prompt_into_messages(form_data)
             # Using /ollama/api/chat endpoint
             form_data = convert_payload_openai_to_ollama(form_data)
             response = await generate_ollama_chat_completion(
