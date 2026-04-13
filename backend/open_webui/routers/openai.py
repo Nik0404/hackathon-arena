@@ -118,7 +118,9 @@ def select_openai_vision_model_id(request: Request) -> Optional[str]:
         if is_vision_model_id(model_id):
             return model_id
 
-    return None
+    # Fall back to the preferred VLM even when model caches are still cold.
+    # resolve_openai_model_route() will refresh the provider model list if needed.
+    return VISION_ROUTE_MODEL_IDS[0]
 
 
 async def send_get_request(
