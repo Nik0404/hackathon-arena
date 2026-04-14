@@ -237,3 +237,60 @@ If you have any questions, suggestions, or need assistance, please open an issue
 ---
 
 Created by [Timothy Jaeryang Baek](https://github.com/tjbck) - Let's make Open WebUI even more amazing together! 💪
+## GPTHub Hackathon Submission
+
+### Quick Start for Jury
+
+One-line start:
+
+```bash
+docker compose up --build -d
+```
+
+Open in browser:
+
+```text
+http://localhost:3000
+```
+
+### Minimal Setup After Start
+
+1. Open `http://localhost:3000` and create the first admin user.
+2. Go to `Admin -> Connections`.
+3. Add an external MWS GPT connection:
+   - `URL`: `https://api.gpt.mws.ru/v1`
+   - `Authentication`: `Bearer`
+   - `API Key`: your `sk-...`
+   - `Provider`: `Open AI`
+   - `API Type`: `Chat Completions`
+4. Add model IDs:
+   - `mws-gpt-alpha`
+   - `bge-m3`
+   - `cotype-pro-vl-32b`
+   - `qwen2.5-vl`
+   - `qwen-image-lightning`
+   - `whisper-medium`
+5. For image settings go to `Admin -> Settings -> Images` and set:
+   - `Model`: `qwen-image-lightning`
+   - `OpenAI API Base URL`: `https://api.gpt.mws.ru/v1`
+   - `OpenAI API Key`: your `sk-...`
+
+### What Is Implemented
+
+- Unified chat interface based on Open WebUI
+- Text chat
+- Image understanding
+- Answers over PDF and files
+- Audio / speech-to-text
+- Web search / web parsing
+- Manual model selection
+- Automatic routing by scenario
+- Long-term memory between chats
+
+### Demo Scenarios
+
+- `Text -> markdown and code response`
+- `Image -> vision analysis`
+- `PDF -> answer by file contents`
+- `Audio -> transcription and answer`
+- `Memory -> fact about user reused in a new chat`
